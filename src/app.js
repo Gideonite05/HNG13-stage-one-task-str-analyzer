@@ -57,37 +57,97 @@ app.post('/strings', async (req, res) => {
   try {
     const { value } = req.body;
 
-    if (!value || typeof value !== 'string') {
-      return res.status(422).json({ error: 'Invalid data type for "value", must be string' });
-    }
+    if (value === undefined)
+      return res.status(422).json({ error: '"value" field is required' });
+
+    if (typeof value !== 'string')
+      return res.status(422).json({ error: '"value" must be a string' });
 
     const properties = analyzeString(value);
 
-    const existing = await StringModel.findOne({
-      where: { id: properties.sha256_hash }
-    });
-
-    if (existing) {
+    const existing = await StringModel.findOne({ where: { id: properties.sha256_hash } });
+    if (existing)
       return res.status(409).json({ error: 'String already exists in the system' });
-    }
 
     const newString = await StringModel.create({
       id: properties.sha256_hash,
       value,
-      properties,
+      properties
     });
 
-    res.status(201).json({
-      id: newString.id,
-      value: newString.value,
-      properties: newString.properties,
-      created_at: newString.created_at,
+    return res.status(201).json(newString);
+
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// --- Natural Language Filtering ---
+app.get('/strings/filter-by-natural-language', async (req, res) => {
+  try {
+    const { query } = req.query;
+    if (!query || typeof query !== 'string')
+      return res.status(400).json({ error: 'Unable to parse natural language query' });
+
+    const parsedFilters = {};
+    let whereClause = {};
+
+    const lowerQuery = query.toLowerCase();
+
+    if (lowerQuery.includes('single word') && lowerQuery.includes('palindromic')) {
+      parsedFilters.word_count = 1;
+      parsedFilters.is_palindrome = true;
+      whereClause = {
+        [Op.and]: [
+          Sequelize.where(Sequelize.json('properties.word_count'), 1),
+          Sequelize.where(Sequelize.json('properties.is_palindrome'), true)
+        ]
+      };
+    } else if (lowerQuery.includes('longer than') && lowerQuery.match(/longer than (\d+)/)) {
+      const minLength = parseInt(lowerQuery.match(/longer than (\d+)/)[1]) + 1;
+      parsedFilters.min_length = minLength;
+      whereClause = {
+        [Op.and]: [
+          Sequelize.where(Sequelize.json('properties.length'), { [Op.gte]: minLength })
+        ]
+      };
+    } else if (lowerQuery.includes('palindromic') && lowerQuery.includes('first vowel')) {
+      parsedFilters.is_palindrome = true;
+      parsedFilters.contains_character = 'a';
+      whereClause = {
+        [Op.and]: [
+          Sequelize.where(Sequelize.json('properties.is_palindrome'), true),
+          { value: { [Op.iLike]: '%a%' } }
+        ]
+      };
+    } else if (lowerQuery.includes('containing the letter') && lowerQuery.match(/letter (\w)/)) {
+      const char = lowerQuery.match(/letter (\w)/)[1];
+      parsedFilters.contains_character = char;
+      whereClause = { value: { [Op.iLike]: `%${char}%` } };
+    } else {
+      return res.status(400).json({ error: 'Unable to parse natural language query' });
+    }
+
+    const { count, rows } = await StringModel.findAndCountAll({
+      where: whereClause,
+      order: [['created_at', 'DESC']]
+    });
+
+    res.status(200).json({
+      data: rows,
+      count,
+      interpreted_query: {
+        original: query,
+        parsed_filters: parsedFilters,
+      },
     });
   } catch (err) {
-    console.error('POST /strings error:', err);
+    console.error('GET /strings/filter-by-natural-language error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 // --- Get Specific String ---
 app.get('/strings/:string_value', async (req, res) => {
@@ -161,11 +221,11 @@ app.get('/strings', async (req, res) => {
       filtersApplied.push({ contains_character });
     }
 
-    const { count, rows } = await StringModel.findAndCountAll({
-      where: { [Op.and]: whereClause },
-      limit: 100,
-      order: [['created_at', 'DESC']]
-    });
+    if (whereClause.length === 0) {
+   const all = await StringModel.findAll();
+   return res.status(200).json({ data: all, count: all.length });
+}
+
 
     res.status(200).json({
       data: rows,
@@ -174,71 +234,6 @@ app.get('/strings', async (req, res) => {
     });
   } catch (err) {
     console.error('GET /strings error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// --- Natural Language Filtering ---
-app.get('/strings/filter-by-natural-language', async (req, res) => {
-  try {
-    const { query } = req.query;
-    if (!query || typeof query !== 'string')
-      return res.status(400).json({ error: 'Unable to parse natural language query' });
-
-    const parsedFilters = {};
-    let whereClause = {};
-
-    const lowerQuery = query.toLowerCase();
-
-    if (lowerQuery.includes('single word') && lowerQuery.includes('palindromic')) {
-      parsedFilters.word_count = 1;
-      parsedFilters.is_palindrome = true;
-      whereClause = {
-        [Op.and]: [
-          Sequelize.where(Sequelize.json('properties.word_count'), 1),
-          Sequelize.where(Sequelize.json('properties.is_palindrome'), true)
-        ]
-      };
-    } else if (lowerQuery.includes('longer than') && lowerQuery.match(/longer than (\d+)/)) {
-      const minLength = parseInt(lowerQuery.match(/longer than (\d+)/)[1]) + 1;
-      parsedFilters.min_length = minLength;
-      whereClause = {
-        [Op.and]: [
-          Sequelize.where(Sequelize.json('properties.length'), { [Op.gte]: minLength })
-        ]
-      };
-    } else if (lowerQuery.includes('palindromic') && lowerQuery.includes('first vowel')) {
-      parsedFilters.is_palindrome = true;
-      parsedFilters.contains_character = 'a';
-      whereClause = {
-        [Op.and]: [
-          Sequelize.where(Sequelize.json('properties.is_palindrome'), true),
-          { value: { [Op.iLike]: '%a%' } }
-        ]
-      };
-    } else if (lowerQuery.includes('containing the letter') && lowerQuery.match(/letter (\w)/)) {
-      const char = lowerQuery.match(/letter (\w)/)[1];
-      parsedFilters.contains_character = char;
-      whereClause = { value: { [Op.iLike]: `%${char}%` } };
-    } else {
-      return res.status(400).json({ error: 'Unable to parse natural language query' });
-    }
-
-    const { count, rows } = await StringModel.findAndCountAll({
-      where: whereClause,
-      order: [['created_at', 'DESC']]
-    });
-
-    res.status(200).json({
-      data: rows,
-      count,
-      interpreted_query: {
-        original: query,
-        parsed_filters: parsedFilters,
-      },
-    });
-  } catch (err) {
-    console.error('GET /strings/filter-by-natural-language error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
